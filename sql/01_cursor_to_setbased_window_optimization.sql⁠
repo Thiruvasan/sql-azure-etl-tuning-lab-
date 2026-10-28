@@ -1,0 +1,72 @@
+/* =========================================================================
+   SCRIPT: 01_cursor_to_setbased_window_optimization.sql
+   PURPOSE: Refactor slow cursor-based YTD Payroll & Tax calculation into
+            a high-speed Set-Based CTE + Window Function query
+   ========================================================================= */
+
+SET STATISTICS IO, TIME ON;
+GO
+
+-- ❌ BEFORE (Anti-Pattern: Non-SARGable Filter + Correlated Subquery Bottleneck)
+/*
+SELECT 
+    p.EmpID,
+    p.PayPeriod,
+    p.BaseSalary,
+    (SELECT SUM(p2.BaseSalary + p2.OvertimePay) 
+     FROM hrp.Payroll_Transactions p2 
+     WHERE p2.EmpID = p.EmpID 
+       AND LEFT(p2.PayPeriod, 4) = LEFT(p.PayPeriod, 4)
+       AND p2.PayPeriod <= p.PayPeriod) AS Cumulative_YTD_Gross
+FROM hrp.Payroll_Transactions p
+WHERE LEFT(p.PayPeriod, 4) = '2026';
+*/
+
+-- ✅ AFTER (Optimized: SARGable Range Filter + Set-Based CTE + Window Functions)
+WITH CTE_Payroll_Base AS (
+    SELECT 
+        EmpID,
+        EmpName,
+        Department,
+        Country,
+        PayPeriod,
+        BaseSalary,
+        OvertimePay,
+        TaxDeducted,
+        (BaseSalary + OvertimePay) AS GrossPay,
+        (BaseSalary + OvertimePay - TaxDeducted) AS NetPay
+    FROM hrp.Payroll_Transactions WITH (NOLOCK)
+    WHERE PayPeriod >= '2026-01' AND PayPeriod <= '2026-12' -- SARGable Index Seek
+),
+CTE_YTD_Calculations AS (
+    SELECT 
+        EmpID,
+        EmpName,
+        Department,
+        Country,
+        PayPeriod,
+        GrossPay,
+        NetPay,
+        -- Cumulative YTD Gross Pay using Window Framing
+        SUM(GrossPay) OVER (
+            PARTITION BY EmpID 
+            ORDER BY PayPeriod ASC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS YTD_Gross_Pay,
+        -- Cumulative YTD Tax Deducted
+        SUM(TaxDeducted) OVER (
+            PARTITION BY EmpID 
+            ORDER BY PayPeriod ASC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS YTD_Tax_Deducted,
+        -- Department Salary Rank
+        DENSE_RANK() OVER (
+            PARTITION BY Department, PayPeriod 
+            ORDER BY (BaseSalary + OvertimePay) DESC
+        ) AS Dept_Earner_Rank
+    FROM CTE_Payroll_Base
+)
+SELECT *
+FROM CTE_YTD_Calculations
+ORDER BY Department, PayPeriod, Dept_Earner_Rank;
+GO
